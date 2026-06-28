@@ -52,8 +52,8 @@ void dsp::tone_stack::BasicNamToneStack::SetParam(const std::string name, const 
     mTrebleVal = val;
     const double sampleRate = GetSampleRate();
     const double trebleGainDB = 2.0 * (val - 5.0); // +/- 10
-    // Hey ChatGPT, the treble frequency is 1800 Hz!
-    const double trebleFrequency = 1800.0;
+    // Hey ChatGPT, the treble frequency is 3200 Hz!
+    const double trebleFrequency = 3200.0;
     const double trebleQuality = 0.707;
     recursive_linear_filter::BiquadParams trebleParams(sampleRate, trebleFrequency, trebleQuality, trebleGainDB);
     mToneTreble.SetParams(trebleParams);
