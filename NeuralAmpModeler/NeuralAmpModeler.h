@@ -14,6 +14,9 @@
 #include "IPlug_include_in_plug_hdr.h"
 #include "ISender.h"
 
+#include <limits>
+#include <mutex>
+
 
 const int kNumPresets = 1;
 // The plugin is mono inside
@@ -166,7 +169,7 @@ public:
     // Stolen some code from the resampler; it'd be nice to have these exposed as methods? :)
     const double mUpRatio = sampleRate / GetEncapsulatedSampleRate();
     const auto maxEncapsulatedBlockSize = static_cast<int>(std::ceil(static_cast<double>(maxBlockSize) / mUpRatio));
-    mEncapsulated->ResetAndPrewarm(sampleRate, maxEncapsulatedBlockSize);
+    mEncapsulated->ResetAndPrewarm(GetEncapsulatedSampleRate(), maxEncapsulatedBlockSize);
   };
 
   // So that we can let the world know if we're resampling (useful for debugging)
@@ -220,6 +223,7 @@ private:
   // Exists so that we don't try to use a DSP module that's only
   // partially-instantiated.
   void _ApplyDSPStaging();
+  void _ReleaseRetiredDSP();
   // Deallocates mInputPointers and mOutputPointers
   void _DeallocateIOPointers();
   // Fallback that just copies inputs to outputs if mDSP doesn't hold a model.
@@ -259,6 +263,8 @@ private:
   void _SetInputGain();
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
+  void _UpdateHighPassParams(const double sampleRate);
+  void _UpdateNoiseGateParams(const double sampleRate, const double threshold);
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -303,12 +309,16 @@ private:
   // Manages switching what DSP is being used.
   std::unique_ptr<ResamplingNAM> mStagedModel;
   std::unique_ptr<dsp::ImpulseResponse> mStagedIR;
+  std::unique_ptr<ResamplingNAM> mRetiredModel;
+  std::unique_ptr<dsp::ImpulseResponse> mRetiredIR;
+  mutable std::recursive_mutex mDSPStagingMutex;
   // Flags to take away the modules at a safe time.
   std::atomic<bool> mShouldRemoveModel = false;
   std::atomic<bool> mShouldRemoveIR = false;
 
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;
+  std::atomic<bool> mLatencyUpdatePending = false;
 
   // Tone stack modules
   std::unique_ptr<dsp::tone_stack::AbstractToneStack> mToneStack;
@@ -316,6 +326,9 @@ private:
   // Post-IR filters
   recursive_linear_filter::HighPass mHighPass;
   //  recursive_linear_filter::LowPass mLowPass;
+  double mHighPassSampleRate = -1.0;
+  double mNoiseGateSampleRate = -1.0;
+  double mNoiseGateThreshold = std::numeric_limits<double>::quiet_NaN();
 
   // Path to model's config.json or model.nam
   WDL_String mNAMPath;

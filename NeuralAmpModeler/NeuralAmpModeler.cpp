@@ -318,6 +318,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
+  _ReleaseRetiredDSP();
   _DeallocateIOPointers();
 }
 
@@ -352,15 +353,8 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   sample** triggerOutput = mInputPointers;
   if (noiseGateActive)
   {
-    const double time = 0.01;
     const double threshold = GetParam(kNoiseGateThreshold)->Value(); // GetParam...
-    const double ratio = 0.1; // Quadratic...
-    const double openTime = 0.005;
-    const double holdTime = 0.01;
-    const double closeTime = 0.05;
-    const dsp::noise_gate::TriggerParams triggerParams(time, threshold, ratio, openTime, holdTime, closeTime);
-    mNoiseGateTrigger.SetParams(triggerParams);
-    mNoiseGateTrigger.SetSampleRate(sampleRate);
+    _UpdateNoiseGateParams(sampleRate, threshold);
     triggerOutput = mNoiseGateTrigger.Process(mInputPointers, numChannelsInternal, numFrames);
   }
 
@@ -385,11 +379,9 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
     irPointers = mIR->Process(toneStackOutPointers, numChannelsInternal, numFrames);
 
   // And the HPF for DC offset (Issue 271)
-  const double highPassCutoffFreq = kDCBlockerFrequency;
   // const double lowPassCutoffFreq = 20000.0;
-  const recursive_linear_filter::HighPassParams highPassParams(sampleRate, highPassCutoffFreq);
   // const recursive_linear_filter::LowPassParams lowPassParams(sampleRate, lowPassCutoffFreq);
-  mHighPass.SetParams(highPassParams);
+  _UpdateHighPassParams(sampleRate);
   // mLowPass.SetParams(lowPassParams);
   sample** hpfPointers = mHighPass.Process(irPointers, numChannelsInternal, numFrames);
   // sample** lpfPointers = mLowPass.Process(hpfPointers, numChannelsInternal, numFrames);
@@ -424,6 +416,9 @@ void NeuralAmpModeler::OnIdle()
 {
   mInputSender.TransmitData(*this);
   mOutputSender.TransmitData(*this);
+  _ReleaseRetiredDSP();
+  if (mLatencyUpdatePending.exchange(false))
+    _UpdateLatency();
 
   if (mNewModelLoadedInDSP)
   {
@@ -462,8 +457,15 @@ bool NeuralAmpModeler::SerializeState(IByteChunk& chunk) const
   chunk.PutStr(version.Get());
   // Model directory (don't serialize the model itself; we'll just load it again
   // when we unserialize)
-  chunk.PutStr(mNAMPath.Get());
-  chunk.PutStr(mIRPath.Get());
+  WDL_String namPath;
+  WDL_String irPath;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+    namPath = mNAMPath;
+    irPath = mIRPath;
+  }
+  chunk.PutStr(namPath.Get());
+  chunk.PutStr(irPath.Get());
   return SerializeParams(chunk);
 }
 
@@ -489,23 +491,37 @@ void NeuralAmpModeler::OnUIOpen()
 {
   Plugin::OnUIOpen();
 
-  if (mNAMPath.GetLength())
+  WDL_String namPath;
+  WDL_String irPath;
+  bool modelLoadFailed = false;
+  bool irLoadFailed = false;
+  bool updateControlsFromModel = false;
   {
-    SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
+    std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+    namPath = mNAMPath;
+    irPath = mIRPath;
+    modelLoadFailed = mNAMPath.GetLength() && mModel == nullptr && mStagedModel == nullptr;
+    irLoadFailed = mIRPath.GetLength() && mIR == nullptr && mStagedIR == nullptr;
+    updateControlsFromModel = mModel != nullptr;
+  }
+
+  if (namPath.GetLength())
+  {
+    SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, namPath.GetLength(), namPath.Get());
     // If it's not loaded yet, then mark as failed.
     // If it's yet to be loaded, then the completion handler will set us straight once it runs.
-    if (mModel == nullptr && mStagedModel == nullptr)
+    if (modelLoadFailed)
       SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
   }
 
-  if (mIRPath.GetLength())
+  if (irPath.GetLength())
   {
-    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
-    if (mIR == nullptr && mStagedIR == nullptr)
+    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, irPath.GetLength(), irPath.Get());
+    if (irLoadFailed)
       SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
   }
 
-  if (mModel != nullptr)
+  if (updateControlsFromModel)
   {
     _UpdateControlsFromModel();
   }
@@ -599,44 +615,66 @@ void NeuralAmpModeler::_AllocateIOPointers(const size_t nChans)
 
 void NeuralAmpModeler::_ApplyDSPStaging()
 {
+  std::unique_lock<std::recursive_mutex> lock(mDSPStagingMutex, std::try_to_lock);
+  if (!lock.owns_lock())
+    return;
+
+  bool updateLatency = false;
+  bool updateInputGain = false;
+  bool updateOutputGain = false;
+
   // Remove marked modules
-  if (mShouldRemoveModel)
+  if (mShouldRemoveModel && mRetiredModel == nullptr)
   {
-    mModel = nullptr;
+    mRetiredModel = std::move(mModel);
     mNAMPath.Set("");
     mShouldRemoveModel = false;
     mConsecutiveSilentFrames = 0;
     mModelCleared = true;
-    _UpdateLatency();
-    _SetInputGain();
-    _SetOutputGain();
+    updateLatency = true;
+    updateInputGain = true;
+    updateOutputGain = true;
   }
-  if (mShouldRemoveIR)
+  if (mShouldRemoveIR && mRetiredIR == nullptr)
   {
-    mIR = nullptr;
+    mRetiredIR = std::move(mIR);
     mIRPath.Set("");
     mShouldRemoveIR = false;
     mConsecutiveSilentFrames = 0;
-    _UpdateLatency();
+    updateLatency = true;
   }
   // Move things from staged to live
-  if (mStagedModel != nullptr)
+  if (mStagedModel != nullptr && mRetiredModel == nullptr)
   {
+    mRetiredModel = std::move(mModel);
     mModel = std::move(mStagedModel);
-    mStagedModel = nullptr;
     mNewModelLoadedInDSP = true;
     mConsecutiveSilentFrames = 0;
-    _UpdateLatency();
-    _SetInputGain();
-    _SetOutputGain();
+    updateLatency = true;
+    updateInputGain = true;
+    updateOutputGain = true;
   }
-  if (mStagedIR != nullptr)
+  if (mStagedIR != nullptr && mRetiredIR == nullptr)
   {
+    mRetiredIR = std::move(mIR);
     mIR = std::move(mStagedIR);
-    mStagedIR = nullptr;
     mConsecutiveSilentFrames = 0;
-    _UpdateLatency();
+    updateLatency = true;
   }
+
+  if (updateLatency)
+    mLatencyUpdatePending = true;
+  if (updateInputGain)
+    _SetInputGain();
+  if (updateOutputGain)
+    _SetOutputGain();
+}
+
+void NeuralAmpModeler::_ReleaseRetiredDSP()
+{
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+  mRetiredModel = nullptr;
+  mRetiredIR = nullptr;
 }
 
 void NeuralAmpModeler::_DeallocateIOPointers()
@@ -667,6 +705,7 @@ void NeuralAmpModeler::_FallbackDSP(iplug::sample** inputs, iplug::sample** outp
 
 void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBlockSize)
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   // Model
   if (mStagedModel != nullptr)
   {
@@ -685,6 +724,11 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     {
       const auto irData = mStagedIR->GetData();
       mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      mStagedIR->PrepareForMaxBlockSize(maxBlockSize);
+    }
+    else
+    {
+      mStagedIR->PrepareForMaxBlockSize(maxBlockSize);
     }
   }
   else if (mIR != nullptr)
@@ -694,12 +738,18 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     {
       const auto irData = mIR->GetData();
       mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      mStagedIR->PrepareForMaxBlockSize(maxBlockSize);
+    }
+    else
+    {
+      mIR->PrepareForMaxBlockSize(maxBlockSize);
     }
   }
 }
 
 void NeuralAmpModeler::_SetInputGain()
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   iplug::sample inputGainDB = GetParam(kInputLevel)->Value();
   // Input calibration
   if ((mModel != nullptr) && (mModel->HasInputLevel()) && GetParam(kCalibrateInput)->Bool())
@@ -711,6 +761,7 @@ void NeuralAmpModeler::_SetInputGain()
 
 void NeuralAmpModeler::_SetOutputGain()
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   double gainDB = GetParam(kOutputLevel)->Value();
   if (mModel != nullptr)
   {
@@ -742,6 +793,7 @@ void NeuralAmpModeler::_SetOutputGain()
 
 void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   const double v = GetParam(kSlim)->Value();
   auto apply = [v](ResamplingNAM* p) {
     if (p == nullptr)
@@ -753,9 +805,41 @@ void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
   apply(mStagedModel.get());
 }
 
+void NeuralAmpModeler::_UpdateHighPassParams(const double sampleRate)
+{
+  if (mHighPassSampleRate == sampleRate)
+    return;
+
+  const recursive_linear_filter::HighPassParams highPassParams(sampleRate, kDCBlockerFrequency);
+  mHighPass.SetParams(highPassParams);
+  mHighPassSampleRate = sampleRate;
+}
+
+void NeuralAmpModeler::_UpdateNoiseGateParams(const double sampleRate, const double threshold)
+{
+  if (mNoiseGateSampleRate == sampleRate && mNoiseGateThreshold == threshold)
+    return;
+
+  const double time = 0.01;
+  const double ratio = 0.1; // Quadratic...
+  const double openTime = 0.005;
+  const double holdTime = 0.01;
+  const double closeTime = 0.05;
+  const dsp::noise_gate::TriggerParams triggerParams(time, threshold, ratio, openTime, holdTime, closeTime);
+  mNoiseGateTrigger.SetParams(triggerParams);
+  mNoiseGateTrigger.SetSampleRate(sampleRate);
+  mNoiseGateSampleRate = sampleRate;
+  mNoiseGateThreshold = threshold;
+}
+
 std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 {
-  WDL_String previousNAMPath = mNAMPath;
+  WDL_String previousNAMPath;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+    previousNAMPath = mNAMPath;
+  }
+  WDL_String loadedNAMPath;
   try
   {
     auto dspPath = std::filesystem::u8path(modelPath.Get());
@@ -778,21 +862,28 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     {
       slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
     }
-    mStagedModel = std::move(temp);
-    mNAMPath = modelPath;
-    mLastNAMBrowseDirectory = modelPath;
-    mLastNAMBrowseDirectory.remove_filepart(true);
-    SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
+    {
+      std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+      mStagedModel = std::move(temp);
+      mNAMPath = modelPath;
+      mLastNAMBrowseDirectory = modelPath;
+      mLastNAMBrowseDirectory.remove_filepart(true);
+      loadedNAMPath = mNAMPath;
+    }
+    SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, loadedNAMPath.GetLength(), loadedNAMPath.Get());
   }
   catch (std::runtime_error& e)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
 
-    if (mStagedModel != nullptr)
     {
-      mStagedModel = nullptr;
+      std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+      if (mStagedModel != nullptr)
+      {
+        mStagedModel = nullptr;
+      }
+      mNAMPath = previousNAMPath;
     }
-    mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
     return e.what();
@@ -804,14 +895,24 @@ dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
 {
   // FIXME it'd be better for the path to be "staged" as well. Just in case the
   // path and the model got caught on opposite sides of the fence...
-  WDL_String previousIRPath = mIRPath;
+  WDL_String previousIRPath;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+    previousIRPath = mIRPath;
+  }
+  WDL_String loadedIRPath;
   const double sampleRate = GetSampleRate();
   dsp::wav::LoadReturnCode wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
   try
   {
     auto irPathU8 = std::filesystem::u8path(irPath.Get());
-    mStagedIR = std::make_unique<dsp::ImpulseResponse>(irPathU8.string().c_str(), sampleRate);
-    wavState = mStagedIR->GetWavState();
+    auto stagedIR = std::make_unique<dsp::ImpulseResponse>(irPathU8.string().c_str(), sampleRate);
+    stagedIR->PrepareForMaxBlockSize(GetBlockSize());
+    wavState = stagedIR->GetWavState();
+    {
+      std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+      mStagedIR = std::move(stagedIR);
+    }
   }
   catch (std::runtime_error& e)
   {
@@ -822,18 +923,25 @@ dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
 
   if (wavState == dsp::wav::LoadReturnCode::SUCCESS)
   {
-    mIRPath = irPath;
-    mLastIRBrowseDirectory = irPath;
-    mLastIRBrowseDirectory.remove_filepart(true);
-    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
+    {
+      std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+      mIRPath = irPath;
+      mLastIRBrowseDirectory = irPath;
+      mLastIRBrowseDirectory.remove_filepart(true);
+      loadedIRPath = mIRPath;
+    }
+    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, loadedIRPath.GetLength(), loadedIRPath.Get());
   }
   else
   {
-    if (mStagedIR != nullptr)
     {
-      mStagedIR = nullptr;
+      std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+      if (mStagedIR != nullptr)
+      {
+        mStagedIR = nullptr;
+      }
+      mIRPath = previousIRPath;
     }
-    mIRPath = previousIRPath;
     SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
   }
 
@@ -979,6 +1087,7 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 
 void NeuralAmpModeler::_UpdateControlsFromModel()
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   if (mModel == nullptr)
   {
     return;
@@ -1014,6 +1123,7 @@ void NeuralAmpModeler::_UpdateControlsFromModel()
 
 void NeuralAmpModeler::_UpdateLatency()
 {
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
   int latency = 0;
   if (mModel)
   {
