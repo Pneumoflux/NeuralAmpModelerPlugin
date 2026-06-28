@@ -56,6 +56,10 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
 
   mNAMPath.Set(static_cast<std::string>(config["NAMPath"]).c_str());
   mIRPath.Set(static_cast<std::string>(config["IRPath"]).c_str());
+  mLastNAMBrowseDirectory.Set(mNAMPath.Get());
+  mLastNAMBrowseDirectory.remove_filepart(true);
+  mLastIRBrowseDirectory.Set(mIRPath.Get());
+  mLastIRBrowseDirectory.remove_filepart(true);
 
   if (mNAMPath.GetLength())
   {

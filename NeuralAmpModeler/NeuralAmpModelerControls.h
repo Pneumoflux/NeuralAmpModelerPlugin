@@ -267,7 +267,8 @@ public:
   NAMFileBrowserControl(const IRECT& bounds, int clearMsgTag, const char* labelStr, const char* fileExtension,
                         IFileDialogCompletionHandlerFunc ch, const IVStyle& style, const ISVG& loadSVG,
                         const ISVG& clearSVG, const ISVG& leftSVG, const ISVG& rightSVG, const IBitmap& bitmap,
-                        const ISVG& globeSVG, const char* getButtonLabel, const char* getButtonURL)
+                        const ISVG& globeSVG, const char* getButtonLabel, const char* getButtonURL,
+                        WDL_String* pLastBrowseDirectory = nullptr)
   : IDirBrowseControlBase(bounds, fileExtension, false, false)
   , mClearMsgTag(clearMsgTag)
   , mDefaultLabelStr(labelStr)
@@ -281,6 +282,7 @@ public:
   , mGlobeSVG(globeSVG)
   , mGetButtonLabel(getButtonLabel)
   , mGetButtonURL(getButtonURL)
+  , mLastBrowseDirectory(pLastBrowseDirectory)
   , mBrowserState(NAMBrowserState::Empty)
   {
     mIgnoreMouse = true;
@@ -332,10 +334,13 @@ public:
       WDL_String fileName;
       WDL_String path;
       GetSelectedFileDirectory(path);
+      if (!path.GetLength() && mLastBrowseDirectory != nullptr)
+        path.Set(mLastBrowseDirectory->Get());
 #ifdef NAM_PICK_DIRECTORY
       pCaller->GetUI()->PromptForDirectory(path, [&](const WDL_String& fileName, const WDL_String& path) {
         if (path.GetLength())
         {
+          SetLastBrowseDirectory(path);
           ClearPathList();
           AddPath(path.Get(), "");
           SetupMenu();
@@ -348,6 +353,7 @@ public:
         fileName, path, EFileAction::Open, mExtension.Get(), [&](const WDL_String& fileName, const WDL_String& path) {
           if (fileName.GetLength())
           {
+            SetLastBrowseDirectory(path);
             ClearPathList();
             AddPath(path.Get(), "");
             SetupMenu();
@@ -442,6 +448,7 @@ public:
         fileName.Set(reinterpret_cast<const char*>(pData));
         directory.Set(reinterpret_cast<const char*>(pData));
         directory.remove_filepart(true);
+        SetLastBrowseDirectory(directory);
 
         ClearPathList();
         AddPath(directory.Get(), "");
@@ -463,6 +470,12 @@ private:
     GetSelectedFile(path);
     path.remove_filepart();
     return;
+  }
+
+  void SetLastBrowseDirectory(const WDL_String& path)
+  {
+    if (mLastBrowseDirectory != nullptr && path.GetLength())
+      mLastBrowseDirectory->Set(path.Get());
   }
 
   // set the state of the browser and the visibility of the "Get" vs. "Clear" buttons
@@ -494,6 +507,7 @@ private:
   // new members for the "Get" button
   const char* mGetButtonLabel;
   const char* mGetButtonURL;
+  WDL_String* mLastBrowseDirectory = nullptr;
   NAMBrowserState mBrowserState;
   NAMSquareButtonControl* mClearButton = nullptr;
   NAMGetButtonControl* mGetButton = nullptr;

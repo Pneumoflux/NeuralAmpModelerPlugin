@@ -95,6 +95,12 @@
     <ClCompile Include="..\AudioDSPTools\dsp\wav.cpp">
       <Filter>dsp</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\iPlug2\WDL\convoengine.cpp">
+      <Filter>dsp</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\iPlug2\WDL\fft.c">
+      <Filter>dsp</Filter>
+    </ClCompile>
     <ClCompile Include="..\ToneStack.cpp" />
   </ItemGroup>
   <ItemGroup>

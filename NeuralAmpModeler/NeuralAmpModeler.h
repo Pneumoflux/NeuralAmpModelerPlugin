@@ -241,6 +241,9 @@ private:
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames);
   // Manage pointers
   void _PrepareIOPointers(const size_t nChans);
+  bool _InputsAreSilent(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn) const;
+  bool _ShouldSkipDSPForSilence(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn);
+  void _ProcessSilentOutput(iplug::sample** outputs, const size_t nFrames, const size_t nChansOut);
   // Copy the input buffer to the object, applying input level.
   // :param nChansIn: In from external
   // :param nChansOut: Out to the internal of the DSP routine
@@ -318,6 +321,10 @@ private:
   WDL_String mNAMPath;
   // Path to IR (.wav file)
   WDL_String mIRPath;
+  WDL_String mLastNAMBrowseDirectory;
+  WDL_String mLastIRBrowseDirectory;
+
+  size_t mConsecutiveSilentFrames = 0;
 
   WDL_String mHighLightColor{PluginColors::NAM_THEMECOLOR.ToColorCode()};
 

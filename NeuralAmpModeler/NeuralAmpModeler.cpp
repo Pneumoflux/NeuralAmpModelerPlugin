@@ -21,6 +21,8 @@ using namespace iplug;
 using namespace igraphics;
 
 const double kDCBlockerFrequency = 5.0;
+const double kSilenceThreshold = 1.0e-7;
+const double kSilenceSkipDelaySeconds = 0.5;
 
 // Styles
 const IVColorSpec colorSpec{
@@ -232,7 +234,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     pGraphics->AttachControl(
       new NAMFileBrowserControl(modelArea, kMsgTagClearModel, defaultNamFileString.c_str(), "nam",
                                 loadModelCompletionHandler, style, fileSVG, crossSVG, leftArrowSVG, rightArrowSVG,
-                                fileBackgroundBitmap, globeSVG, "Get NAM Models", getUrl),
+                                fileBackgroundBitmap, globeSVG, "Get NAM Models", getUrl, &mLastNAMBrowseDirectory),
       kCtrlTagModelFileBrowser);
 
     auto hideSlimOverlay = [](IControl* pCaller) {
@@ -262,7 +264,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     pGraphics->AttachControl(
       new NAMFileBrowserControl(irArea, kMsgTagClearIR, defaultIRString.c_str(), "wav", loadIRCompletionHandler, style,
                                 fileSVG, crossSVG, leftArrowSVG, rightArrowSVG, fileBackgroundBitmap, globeSVG,
-                                "Get IRs", getUrl),
+                                "Get IRs", getUrl, &mLastIRBrowseDirectory),
       kCtrlTagIRFileBrowser);
     pGraphics->AttachControl(
       new NAMSwitchControl(ngToggleArea, kNoiseGateActive, "Noise Gate", style, switchHandleBitmap));
@@ -332,10 +334,17 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   std::feholdexcept(&fe_state);
   disable_denormals();
 
+  _ApplyDSPStaging();
+  if (_ShouldSkipDSPForSilence(inputs, numFrames, numChannelsExternalIn))
+  {
+    _ProcessSilentOutput(outputs, numFrames, numChannelsExternalOut);
+    std::feupdateenv(&fe_state);
+    return;
+  }
+
   _PrepareBuffers(numChannelsInternal, numFrames);
   // Input is collapsed to mono in preparation for the NAM.
   _ProcessInput(inputs, numFrames, numChannelsExternalIn, numChannelsInternal);
-  _ApplyDSPStaging();
   const bool noiseGateActive = GetParam(kNoiseGateActive)->Value();
   const bool toneStackActive = GetParam(kEQActive)->Value();
 
@@ -402,11 +411,7 @@ void NeuralAmpModeler::OnReset()
   const auto sampleRate = GetSampleRate();
   const int maxBlockSize = GetBlockSize();
 
-  // Tail is because the HPF DC blocker has a decay.
-  // 10 cycles should be enough to pass the VST3 tests checking tail behavior.
-  // I'm ignoring the model & IR, but it's not the end of the world.
-  const int tailCycles = 10;
-  SetTailSize(tailCycles * (int)(sampleRate / kDCBlockerFrequency));
+  SetTailSize(0);
   mInputSender.Reset(sampleRate);
   mOutputSender.Reset(sampleRate);
   // If there is a model or IR loaded, they need to be checked for resampling.
@@ -600,6 +605,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mModel = nullptr;
     mNAMPath.Set("");
     mShouldRemoveModel = false;
+    mConsecutiveSilentFrames = 0;
     mModelCleared = true;
     _UpdateLatency();
     _SetInputGain();
@@ -610,6 +616,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mIR = nullptr;
     mIRPath.Set("");
     mShouldRemoveIR = false;
+    mConsecutiveSilentFrames = 0;
+    _UpdateLatency();
   }
   // Move things from staged to live
   if (mStagedModel != nullptr)
@@ -617,6 +625,7 @@ void NeuralAmpModeler::_ApplyDSPStaging()
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
     mNewModelLoadedInDSP = true;
+    mConsecutiveSilentFrames = 0;
     _UpdateLatency();
     _SetInputGain();
     _SetOutputGain();
@@ -625,6 +634,8 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   {
     mIR = std::move(mStagedIR);
     mStagedIR = nullptr;
+    mConsecutiveSilentFrames = 0;
+    _UpdateLatency();
   }
 }
 
@@ -769,6 +780,8 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     }
     mStagedModel = std::move(temp);
     mNAMPath = modelPath;
+    mLastNAMBrowseDirectory = modelPath;
+    mLastNAMBrowseDirectory.remove_filepart(true);
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
   }
   catch (std::runtime_error& e)
@@ -810,6 +823,8 @@ dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
   if (wavState == dsp::wav::LoadReturnCode::SUCCESS)
   {
     mIRPath = irPath;
+    mLastIRBrowseDirectory = irPath;
+    mLastIRBrowseDirectory.remove_filepart(true);
     SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
   }
   else
@@ -880,6 +895,39 @@ void NeuralAmpModeler::_PrepareIOPointers(const size_t numChannels)
 {
   _DeallocateIOPointers();
   _AllocateIOPointers(numChannels);
+}
+
+bool NeuralAmpModeler::_InputsAreSilent(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn) const
+{
+  if (nChansIn == 0)
+    return true;
+
+  for (size_t c = 0; c < nChansIn; c++)
+    for (size_t s = 0; s < nFrames; s++)
+      if (std::abs(inputs[c][s]) > kSilenceThreshold)
+        return false;
+
+  return true;
+}
+
+bool NeuralAmpModeler::_ShouldSkipDSPForSilence(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn)
+{
+  if (!_InputsAreSilent(inputs, nFrames, nChansIn))
+  {
+    mConsecutiveSilentFrames = 0;
+    return false;
+  }
+
+  mConsecutiveSilentFrames += nFrames;
+  const size_t skipDelayFrames = static_cast<size_t>(kSilenceSkipDelaySeconds * GetSampleRate());
+  return mConsecutiveSilentFrames >= skipDelayFrames;
+}
+
+void NeuralAmpModeler::_ProcessSilentOutput(iplug::sample** outputs, const size_t nFrames, const size_t nChansOut)
+{
+  for (size_t c = 0; c < nChansOut; c++)
+    for (size_t s = 0; s < nFrames; s++)
+      outputs[c][s] = 0.0;
 }
 
 void NeuralAmpModeler::_ProcessInput(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn,
@@ -970,6 +1018,10 @@ void NeuralAmpModeler::_UpdateLatency()
   if (mModel)
   {
     latency += mModel->GetLatency();
+  }
+  if (mIR)
+  {
+    latency += mIR->GetLatency();
   }
   // Other things that add latency here...
 
