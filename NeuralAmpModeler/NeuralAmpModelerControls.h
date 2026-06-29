@@ -662,6 +662,22 @@ private:
   bool mHasInfo = false;
 };
 
+class OversamplingControl : public IVRadioButtonControl
+{
+public:
+  OversamplingControl(const IRECT& bounds, int paramIdx, const IVStyle& style, float buttonSize,
+                      EDirection direction = EDirection::Horizontal)
+  : IVRadioButtonControl(bounds, paramIdx, {}, GetParamLabel(paramIdx), style, EVShape::Ellipse, direction, buttonSize)
+  {
+  }
+
+private:
+  static const char* GetParamLabel(int paramIdx)
+  {
+    return paramIdx == kOfflineOversamplingFactor ? "Offline Oversampling" : "Oversampling";
+  }
+};
+
 class OutputModeControl : public IVRadioButtonControl
 {
 public:
@@ -814,6 +830,21 @@ public:
         "are about the same loudness.\nCalibrated=Match the input's digital-analog calibration.");
     }
 
+    {
+      const float buttonSize = 10.0f;
+      const auto osArea = titleArea.GetFromBottom(84.0f).GetTranslated(0.0f, 160.0f);
+      const auto realtimeArea = osArea.GetFromTop(36.0f);
+      const auto offlineArea = osArea.GetFromBottom(36.0f);
+      auto* realtimeOversamplingControl = AddNamedChildControl(
+        new OversamplingControl(realtimeArea, kOversamplingFactor, mRadioButtonStyle, buttonSize),
+        mControlNames.oversampling, kCtrlTagOversampling);
+      realtimeOversamplingControl->SetTooltip("Realtime oversampling factor. Higher values reduce model aliasing but increase CPU and latency.");
+      auto* offlineOversamplingControl = AddNamedChildControl(
+        new OversamplingControl(offlineArea, kOfflineOversamplingFactor, mRadioButtonStyle, buttonSize),
+        mControlNames.offlineOversampling, kCtrlTagOfflineOversampling);
+      offlineOversamplingControl->SetTooltip("Offline/render oversampling factor. Allows up to 16x for non-realtime bounces.");
+    }
+
     const float halfWidth = PLUG_WIDTH / 2.0f - pad;
     const auto bottomArea = GetRECT().GetPadded(-pad).GetFromBottom(78.0f);
     const float lineHeight = 15.0f;
@@ -859,6 +890,8 @@ private:
     const std::string inputCalibrationLevel = "InputCalibrationLevel";
     const std::string modelInfo = "ModelInfo";
     const std::string outputMode = "OutputMode";
+    const std::string oversampling = "Oversampling";
+    const std::string offlineOversampling = "OfflineOversampling";
     const std::string title = "Title";
   } mControlNames;
 

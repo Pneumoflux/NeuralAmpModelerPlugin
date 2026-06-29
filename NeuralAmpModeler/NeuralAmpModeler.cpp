@@ -96,6 +96,8 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
   GetParam(kInputCalibrationLevel)
     ->InitDouble(kInputCalibrationLevelParamName.c_str(), kDefaultInputCalibrationLevel, -60.0, 60.0, 0.1, "dBu");
   GetParam(kSlim)->InitDouble("Slim", 0.0, 0.0, 1.0, 0.01);
+  GetParam(kOversamplingFactor)->InitEnum("Oversampling", 0, {"Off", "2x", "4x", "8x"});
+  GetParam(kOfflineOversamplingFactor)->InitEnum("Offline Oversampling", 0, {"Off", "2x", "4x", "8x", "16x"});
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
 
@@ -409,6 +411,7 @@ void NeuralAmpModeler::OnReset()
   // If there is a model or IR loaded, they need to be checked for resampling.
   _ResetModelAndIR(sampleRate, GetBlockSize());
   mToneStack->Reset(sampleRate, maxBlockSize);
+  _ApplyOversamplingFactorToLoadedNAMs();
   _UpdateLatency();
 }
 
@@ -417,6 +420,8 @@ void NeuralAmpModeler::OnIdle()
   mInputSender.TransmitData(*this);
   mOutputSender.TransmitData(*this);
   _ReleaseRetiredDSP();
+  if (mOversamplingUpdatePending.exchange(false))
+    _ApplyOversamplingFactorToLoadedNAMs();
   if (mLatencyUpdatePending.exchange(false))
     _UpdateLatency();
 
@@ -543,6 +548,22 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneMid: mToneStack->SetParam("middle", GetParam(paramIdx)->Value()); break;
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
+    case kOversamplingFactor:
+    {
+      const int enumValue = static_cast<int>(GetParam(kOversamplingFactor)->Value());
+      mOversamplingFactor = 1 << enumValue;
+      if (!GetRenderingOffline())
+        mOversamplingUpdatePending = true;
+      break;
+    }
+    case kOfflineOversamplingFactor:
+    {
+      const int enumValue = static_cast<int>(GetParam(kOfflineOversamplingFactor)->Value());
+      mOfflineOversamplingFactor = 1 << enumValue;
+      if (GetRenderingOffline())
+        mOversamplingUpdatePending = true;
+      break;
+    }
     default: break;
   }
 }
@@ -791,6 +812,24 @@ void NeuralAmpModeler::_SetOutputGain()
   mOutputGain = DBToAmp(gainDB);
 }
 
+int NeuralAmpModeler::_GetActiveOversamplingFactor() const
+{
+  return GetRenderingOffline() ? mOfflineOversamplingFactor.load() : mOversamplingFactor.load();
+}
+
+void NeuralAmpModeler::_ApplyOversamplingFactorToLoadedNAMs()
+{
+  std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
+  const int factor = _GetActiveOversamplingFactor();
+  auto apply = [factor](ResamplingNAM* p) {
+    if (p != nullptr && p->GetOversamplingFactor() != factor)
+      p->SetOversamplingFactor(factor);
+  };
+  apply(mModel.get());
+  apply(mStagedModel.get());
+  mLatencyUpdatePending = true;
+}
+
 void NeuralAmpModeler::_ApplySlimParamToLoadedNAMs()
 {
   std::lock_guard<std::recursive_mutex> lock(mDSPStagingMutex);
@@ -857,6 +896,7 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     }
 
     std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+    temp->SetOversamplingFactor(_GetActiveOversamplingFactor());
     temp->Reset(GetSampleRate(), GetBlockSize());
     if (nam::SlimmableModel* slimmable = temp->GetSlimmableModel())
     {
