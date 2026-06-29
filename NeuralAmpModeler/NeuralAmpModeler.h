@@ -14,7 +14,10 @@
 #include "IPlug_include_in_plug_hdr.h"
 #include "ISender.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 
@@ -50,6 +53,8 @@ enum EParams
   kInputCalibrationLevel,
   kOutputMode,
   kSlim,
+  kOversamplingFactor,
+  kOfflineOversamplingFactor,
   kNumParams
 };
 
@@ -68,6 +73,8 @@ enum ECtrlTags
   kCtrlTagSlimmableIcon,
   kCtrlTagSlimOverlayBackdrop,
   kCtrlTagSlimKnob,
+  kCtrlTagOversampling,
+  kCtrlTagOfflineOversampling,
   kNumCtrlTags
 };
 
@@ -105,7 +112,6 @@ public:
   ResamplingNAM(std::unique_ptr<nam::DSP> encapsulated, const double expected_sample_rate)
   : nam::DSP(encapsulated->NumInputChannels(), encapsulated->NumOutputChannels(), expected_sample_rate)
   , mEncapsulated(std::move(encapsulated))
-  , mResampler(GetNAMSampleRate(mEncapsulated))
   {
     // Assign the encapsulated object's processing function  to this object's member so that the resampler can use it:
     auto ProcessBlockFunc = [&](NAM_SAMPLE** input, NAM_SAMPLE** output, int numFrames) {
@@ -153,27 +159,44 @@ public:
     }
     else
     {
-      mResampler.ProcessBlock(input, output, num_frames, mBlockProcessFunc);
+      mResampler->ProcessBlock(input, output, num_frames, mBlockProcessFunc);
     }
   };
 
-  int GetLatency() const { return NeedToResample() ? mResampler.GetLatency() : 0; };
+  int GetLatency() const { return NeedToResample() && mResampler != nullptr ? mResampler->GetLatency() : 0; };
 
   void Reset(const double sampleRate, const int maxBlockSize) override
   {
     mExpectedSampleRate = sampleRate;
     mMaxExternalBlockSize = maxBlockSize;
-    mResampler.Reset(sampleRate, maxBlockSize);
+    const double renderingSampleRate = GetRenderingSampleRate(sampleRate);
+    const bool needToRecreateResampler = mResampler == nullptr || mRenderingSampleRate != renderingSampleRate;
+    if (needToRecreateResampler)
+    {
+      mResampler = std::make_unique<dsp::ResamplingContainer<NAM_SAMPLE, 1, 12>>(renderingSampleRate);
+      mRenderingSampleRate = renderingSampleRate;
+    }
+    mResampler->Reset(sampleRate, maxBlockSize);
 
     // Allocations in the encapsulated model (HACK)
     // Stolen some code from the resampler; it'd be nice to have these exposed as methods? :)
-    const double mUpRatio = sampleRate / GetEncapsulatedSampleRate();
-    const auto maxEncapsulatedBlockSize = static_cast<int>(std::ceil(static_cast<double>(maxBlockSize) / mUpRatio));
-    mEncapsulated->ResetAndPrewarm(GetEncapsulatedSampleRate(), maxEncapsulatedBlockSize);
+    const double renderingRatio = renderingSampleRate / sampleRate;
+    const auto maxEncapsulatedBlockSize =
+      static_cast<int>(std::ceil(static_cast<double>(maxBlockSize) * renderingRatio)) + 1;
+    mEncapsulated->ResetAndPrewarm(renderingSampleRate, maxEncapsulatedBlockSize);
   };
 
   // So that we can let the world know if we're resampling (useful for debugging)
   double GetEncapsulatedSampleRate() const { return GetNAMSampleRate(mEncapsulated); };
+
+  void SetOversamplingFactor(int factor)
+  {
+    mRequestedOversamplingFactor = std::max(1, factor);
+    if (mMaxExternalBlockSize > 0)
+      Reset(mExpectedSampleRate, mMaxExternalBlockSize);
+  }
+
+  int GetOversamplingFactor() const { return mRequestedOversamplingFactor; }
 
   nam::SlimmableModel* GetSlimmableModel() { return dynamic_cast<nam::SlimmableModel*>(mEncapsulated.get()); }
   const nam::SlimmableModel* GetSlimmableModel() const
@@ -182,12 +205,22 @@ public:
   }
 
 private:
-  bool NeedToResample() const { return GetExpectedSampleRate() != GetEncapsulatedSampleRate(); };
+  double GetRenderingSampleRate(double externalSampleRate) const
+  {
+    if (mRequestedOversamplingFactor <= 1)
+      return GetEncapsulatedSampleRate();
+
+    return externalSampleRate * static_cast<double>(mRequestedOversamplingFactor);
+  }
+
+  bool NeedToResample() const { return std::abs(GetExpectedSampleRate() - mRenderingSampleRate) > 1.0e-6; };
   // The encapsulated NAM
   std::unique_ptr<nam::DSP> mEncapsulated;
 
   // The resampling wrapper
-  dsp::ResamplingContainer<NAM_SAMPLE, 1, 12> mResampler;
+  std::unique_ptr<dsp::ResamplingContainer<NAM_SAMPLE, 1, 12>> mResampler;
+  double mRenderingSampleRate = 0.0;
+  int mRequestedOversamplingFactor = 1;
 
   // Used to check that we don't get too large a block to process.
   int mMaxExternalBlockSize = 0;
@@ -265,6 +298,8 @@ private:
   void _ApplySlimParamToLoadedNAMs();
   void _UpdateHighPassParams(const double sampleRate);
   void _UpdateNoiseGateParams(const double sampleRate, const double threshold);
+  int _GetActiveOversamplingFactor() const;
+  void _ApplyOversamplingFactorToLoadedNAMs();
 
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
@@ -319,6 +354,10 @@ private:
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;
   std::atomic<bool> mLatencyUpdatePending = false;
+  std::atomic<bool> mOversamplingUpdatePending = false;
+
+  std::atomic<int> mOversamplingFactor = 1;
+  std::atomic<int> mOfflineOversamplingFactor = 1;
 
   // Tone stack modules
   std::unique_ptr<dsp::tone_stack::AbstractToneStack> mToneStack;
